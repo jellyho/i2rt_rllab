@@ -834,6 +834,17 @@ class Recorder:
                 self._rollout_ended = False
                 if not self._ep_empty():
                     self._end_eval_rollout()
+                # The chunk counter restarts at the ROLLOUT boundary, always -- not as a side
+                # effect of _reset_episode, which three of the four end paths never reach: an
+                # empty rollout is skipped here, and review_before_save parks the episode pending
+                # instead of submitting it. A counter left above zero makes the NEXT rollout look
+                # already started, so it records from its first tick -- through the whole wait for
+                # the first inference, a JAX compile of tens of seconds of a motionless arm. That
+                # is the "saves everything including the server wait" report, and it is what the
+                # `started` guard exists to prevent.
+                with self._lock:
+                    self._pending_sends = 0
+                self._action_seq = 0
 
             # ONE FRAME PER TICK, exactly like teleop -- not one per action the runner sent.
             #

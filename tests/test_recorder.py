@@ -1115,3 +1115,33 @@ def test_the_sample_frame_declares_every_key_a_real_frame_carries(tmp_path):
         assert sample - real == set(), f"the schema declares keys no frame carries: {sample - real}"
     finally:
         rec.shutdown()
+
+
+def test_an_empty_rollout_still_resets_the_chunk_counter(tmp_path):
+    """The counter restarts at the rollout boundary whatever happened to the episode.
+
+    Three of the four end paths never reach _reset_episode: an empty rollout is skipped, a
+    discarded one and a pending one take their own routes. A counter left above zero makes the
+    NEXT rollout look already started, so it records from its first tick -- through the whole wait
+    for the first inference, which is a motionless arm during a JAX compile.
+    """
+    cfg = RecorderConfig(
+        repo_id="test/emptyseq", root=str(tmp_path), fps=30, mock=True, record_source="eval", review_before_save=False
+    )
+    rec = Recorder(cfg)
+    rec.cameras.start()
+    rec.robot.start()
+    rec._last_images = rec.cameras.read()
+    rec.writer = rec._open_writer()
+    rec.gate.arm()
+    try:
+        # a rollout that ends without ever recording a frame (the send landed, the tick did not)
+        rec.note_action_sent(np.zeros(ACTION_DIM, dtype=np.float32))
+        rec.end_rollout()
+        rec._step(rec.get_last_images(), rec.robot.get_snapshot())
+        assert rec._action_seq == 0, "an empty rollout must still restart the count"
+        # so the next rollout records nothing until its own first action
+        rec._step(rec.get_last_images(), rec.robot.get_snapshot())
+        assert rec.get_status()["frames"] == 0, "the wait before the first action is not the rollout"
+    finally:
+        rec.shutdown()
