@@ -63,6 +63,7 @@ class CameraManager:
         self._pipelines: Dict[str, object] = {}
         self._serials: Dict[str, str] = {}  # resolved serial per key (for reconnect)
         self._last: Dict[str, np.ndarray] = {}  # latest frame per key (written by the capture thread)
+        self._stamp: Dict[str, float] = {}
         self._healthy: Dict[str, bool] = {}
         # Per-camera pinhole intrinsics, filled in on open; see _read_intrinsics.
         self._intrinsics: Dict[str, dict] = {}
@@ -118,6 +119,12 @@ class CameraManager:
                     img = np.asanyarray(frames.get_color_frame().get_data())  # HxWx3 uint8 (rgb8)
                     with self._cap_lock:
                         self._last[spec.key] = img
+                        # When this frame arrived, so a consumer can ask how stale the image it
+                        # just paired with an action was. The recorder samples the LATEST cached
+                        # frame, so a consecutive pair of reads inside one camera period gets the
+                        # same image -- which reads as a freeze in the video and is invisible
+                        # without this. Nothing is written to the dataset; see age_s().
+                        self._stamp[spec.key] = time.monotonic()
                     if not self._healthy.get(spec.key, True):  # was down -> recovered
                         logger.info("camera '%s' recovered", spec.key)
                     self._healthy[spec.key] = True
@@ -165,7 +172,9 @@ class CameraManager:
         if supported and spec.fps not in supported:
             usable = [f for f in supported if f <= spec.fps] or supported
             fps = max(usable)
-            logger.info("camera '%s': %d fps unsupported; using %d fps (available: %s)", spec.key, spec.fps, fps, supported)
+            logger.info(
+                "camera '%s': %d fps unsupported; using %d fps (available: %s)", spec.key, spec.fps, fps, supported
+            )
         self._fps[spec.key] = fps
         return fps
 
@@ -194,9 +203,12 @@ class CameraManager:
         try:
             intr = profile.get_stream(_rs().stream.color).as_video_stream_profile().get_intrinsics()
             self._intrinsics[spec.key] = {
-                "fx": float(intr.fx), "fy": float(intr.fy),
-                "cx": float(intr.ppx), "cy": float(intr.ppy),
-                "width": int(intr.width), "height": int(intr.height),
+                "fx": float(intr.fx),
+                "fy": float(intr.fy),
+                "cx": float(intr.ppx),
+                "cy": float(intr.ppy),
+                "width": int(intr.width),
+                "height": int(intr.height),
             }
         except Exception as e:
             self._intrinsics.pop(spec.key, None)
@@ -240,13 +252,29 @@ class CameraManager:
                 if not (rng.min <= value <= rng.max):
                     logger.warning(
                         "camera '%s': option '%s'=%g out of range [%g, %g] (ignored)",
-                        spec.key, name, value, rng.min, rng.max,
+                        spec.key,
+                        name,
+                        value,
+                        rng.min,
+                        rng.max,
                     )
                     continue
                 sensor.set_option(option, value)
                 logger.info("camera '%s': %s = %g", spec.key, name, value)
             except Exception as e:
                 logger.warning("camera '%s': could not set option '%s'=%g: %s", spec.key, name, value, e)
+
+    def age_s(self) -> Dict[str, float]:
+        """Seconds since each camera's cached frame arrived. Empty in mock mode.
+
+        Diagnostic only: the recorder logs the worst of these per episode so "the image was N ms
+        old when it was paired with that action" is answerable without a schema change.
+        """
+        if self.cfg.mock:
+            return {}
+        now = time.monotonic()
+        with self._cap_lock:
+            return {k: now - t for k, t in self._stamp.items()}
 
     def read(self) -> Dict[str, np.ndarray]:
         """Return {key: HxWx3 uint8 RGB} — the latest cached frame per camera, copied.

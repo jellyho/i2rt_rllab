@@ -114,10 +114,15 @@ def test_recorder_records_episode_and_outcome(tmp_path):
     assert saved[0]["episode"] == 0
 
 
-def test_eval_rollout_records_one_frame_per_sent_action(tmp_path):
-    # Eval recording is SEND-DRIVEN: the runner calls note_action_sent once per action it pushes to
-    # the robot, and the record loop writes exactly one frame per call. So recorded frames ==
-    # executed actions, and nothing is recorded on held/paused ticks (no action is sent then).
+def test_eval_records_at_the_loop_rate_once_the_rollout_has_started(tmp_path):
+    """Eval samples at the record rate, like teleop -- NOT once per action the runner sends.
+
+    It used to be send-driven, and that made the recording's time axis a fiction: no action is
+    sent while the policy infers, so the hold left no frames while LeRobot writes
+    timestamp = frame_index / fps regardless. What is preserved is the START: nothing is recorded
+    until the first action, because the ticks before it are a stationary arm waiting on a JAX
+    compile.
+    """
     cfg = RecorderConfig(
         repo_id="test/eval", root=str(tmp_path), fps=60, mock=True, record_source="eval", review_before_save=False
     )
@@ -125,19 +130,17 @@ def test_eval_rollout_records_one_frame_per_sent_action(tmp_path):
     rec.start()
     rec.arm()
     time.sleep(0.3)
-    assert rec.get_status()["frames"] == 0  # armed, but no policy is driving yet -> no frames
+    assert rec.get_status()["frames"] == 0  # armed, but nothing commanded yet -> no frames
 
-    n = 8
-    for i in range(n):
-        rec.note_action_sent(np.full(ACTION_DIM, float(i), dtype=np.float32))
-        time.sleep(0.05)  # let the record loop drain the queue
-    time.sleep(0.2)
+    rec.note_action_sent(np.zeros(ACTION_DIM, dtype=np.float32))  # one chunk, then hold
+    time.sleep(0.4)
     frames = rec.get_status()["frames"]
     rec.disarm()  # eval: ends the rollout and submits it
     rec.shutdown()
-    assert frames == n  # strict 1:1 -- one frame per action sent, no more, no fewer
+    # One send, many ticks: the hold is recorded rather than vanishing, which is the whole change.
+    assert frames > 1, f"the hold after a single send should still be recorded, got {frames}"
     assert rec.writer.num_episodes >= 1
-    assert rec.writer.saved_episodes[0]["frames"] == n
+    assert rec.writer.saved_episodes[0]["frames"] == frames
 
 
 def test_note_action_sent_is_a_noop_until_armed_in_eval(tmp_path):
@@ -892,7 +895,7 @@ def test_each_eval_rollout_is_its_own_episode(tmp_path):
         for rollout in range(2):
             for i in range(4):
                 rec.note_action_sent(np.full(ACTION_DIM, float(rollout * 10 + i), dtype=np.float32))
-            rec._step(rec.get_last_images(), rec.robot.get_snapshot())
+                rec._step(rec.get_last_images(), rec.robot.get_snapshot())
             assert rec.get_status()["frames"] == 4, "this rollout's own frames"
 
             rec.end_rollout()  # the runner: the policy stopped driving
@@ -953,3 +956,111 @@ def test_teleop_still_uses_the_button_map():
     rec = Recorder(RecorderConfig(record_source="teleop", mock=False))
     assert rec._button_outcome, "teleop keeps its outcome map"
     assert rec._button_outcome.get("right.0") == "discard", "the teleop map, unchanged"
+
+
+# --------------------------------------------------------------- eval records the way teleop does
+def test_eval_records_one_frame_per_tick_not_one_per_sent_action(tmp_path):
+    """The recording's time axis has to be real, and the way to get that is to sample like teleop.
+
+    Send-driven capture wrote one frame per action the runner pushed, so the stretch where the
+    policy is inferring -- during which nothing is sent -- left NO frames, while LeRobot writes
+    timestamp = frame_index / fps regardless. A 150 ms hold replayed as 0 ms and the motion tore.
+    Here the loop ticks four times and only two sends land; four frames must be recorded, because
+    the arm was there for all four.
+    """
+    cfg = RecorderConfig(
+        repo_id="test/tick", root=str(tmp_path), fps=30, mock=True, record_source="eval", review_before_save=False
+    )
+    rec = Recorder(cfg)
+    rec.cameras.start()
+    rec.robot.start()
+    rec._last_images = rec.cameras.read()
+    rec.writer = rec._open_writer()
+    rec.gate.arm()
+    try:
+        for tick in range(4):
+            if tick in (0, 2):  # a replan on two of the four ticks
+                rec.note_action_sent(np.zeros(ACTION_DIM, dtype=np.float32))
+            rec._step(rec.get_last_images(), rec.robot.get_snapshot())
+        assert rec.get_status()["frames"] == 4, "a tick with no send is still a moment the arm existed"
+    finally:
+        rec.shutdown()
+
+
+def test_nothing_is_recorded_before_the_first_action_of_a_rollout(tmp_path):
+    """The episode still starts at the first commanded action.
+
+    The ticks before it are a stationary arm waiting on the first inference -- a JAX compile is
+    tens of seconds -- and recording those with control_mode=policy is what teaches a policy to
+    hold still. Only the holds BETWEEN chunks are new.
+    """
+    cfg = RecorderConfig(
+        repo_id="test/pre", root=str(tmp_path), fps=30, mock=True, record_source="eval", review_before_save=False
+    )
+    rec = Recorder(cfg)
+    rec.cameras.start()
+    rec.robot.start()
+    rec._last_images = rec.cameras.read()
+    rec.writer = rec._open_writer()
+    rec.gate.arm()
+    try:
+        for _ in range(3):  # armed, nothing sent yet
+            rec._step(rec.get_last_images(), rec.robot.get_snapshot())
+        assert rec.get_status()["frames"] == 0
+        rec.note_action_sent(np.zeros(ACTION_DIM, dtype=np.float32))
+        rec._step(rec.get_last_images(), rec.robot.get_snapshot())
+        assert rec.get_status()["frames"] == 1
+    finally:
+        rec.shutdown()
+
+
+def test_action_seq_marks_the_chunk_boundary(tmp_path):
+    """Nothing is dropped, so the send stream has to be recoverable from the recording itself.
+
+    `action_seq` is constant inside a chunk and increments at a replan, which is what tells a
+    held frame from a fresh one -- the information send-driven capture used to carry by omitting
+    the held frames entirely.
+    """
+    cfg = RecorderConfig(
+        repo_id="test/seq", root=str(tmp_path), fps=30, mock=True, record_source="eval", review_before_save=False
+    )
+    rec = Recorder(cfg)
+    rec.cameras.start()
+    rec.robot.start()
+    rec._last_images = rec.cameras.read()
+    rec.writer = rec._open_writer()
+    rec.gate.arm()
+    try:
+        sends = [True, False, False, True, False]
+        for send in sends:
+            if send:
+                rec.note_action_sent(np.zeros(ACTION_DIM, dtype=np.float32))
+            rec._step(rec.get_last_images(), rec.robot.get_snapshot())
+        seq = [int(f["action_seq"][0]) for f in _in_flight(rec)]
+        assert seq == [1, 1, 1, 2, 2], seq
+    finally:
+        rec.shutdown()
+
+
+def test_action_seq_restarts_each_rollout(tmp_path):
+    """Chunk numbering is per episode; rollout two must not continue rollout one's count."""
+    cfg = RecorderConfig(
+        repo_id="test/seq2", root=str(tmp_path), fps=30, mock=True, record_source="eval", review_before_save=False
+    )
+    rec = Recorder(cfg)
+    rec.cameras.start()
+    rec.robot.start()
+    rec._last_images = rec.cameras.read()
+    rec.writer = rec._open_writer()
+    rec.gate.arm()
+    try:
+        for _ in range(2):
+            rec.note_action_sent(np.zeros(ACTION_DIM, dtype=np.float32))
+            rec._step(rec.get_last_images(), rec.robot.get_snapshot())
+        rec.end_rollout()
+        rec._step(rec.get_last_images(), rec.robot.get_snapshot())
+        rec.note_action_sent(np.zeros(ACTION_DIM, dtype=np.float32))
+        rec._step(rec.get_last_images(), rec.robot.get_snapshot())
+        assert [int(f["action_seq"][0]) for f in _in_flight(rec)] == [1]
+    finally:
+        rec.shutdown()
