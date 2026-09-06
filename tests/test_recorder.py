@@ -114,32 +114,6 @@ def test_recorder_records_episode_and_outcome(tmp_path):
     assert saved[0]["episode"] == 0
 
 
-def test_eval_rollout_records_one_frame_per_sent_action(tmp_path):
-    # Eval recording is SEND-DRIVEN: the runner calls note_action_sent once per action it pushes to
-    # the robot, and the record loop writes exactly one frame per call. So recorded frames ==
-    # executed actions, and nothing is recorded on held/paused ticks (no action is sent then).
-    cfg = RecorderConfig(
-        repo_id="test/eval", root=str(tmp_path), fps=60, mock=True, record_source="eval", review_before_save=False
-    )
-    rec = Recorder(cfg)
-    rec.start()
-    rec.arm()
-    time.sleep(0.3)
-    assert rec.get_status()["frames"] == 0  # armed, but no policy is driving yet -> no frames
-
-    n = 8
-    for i in range(n):
-        rec.note_action_sent(np.full(ACTION_DIM, float(i), dtype=np.float32))
-        time.sleep(0.05)  # let the record loop drain the queue
-    time.sleep(0.2)
-    frames = rec.get_status()["frames"]
-    rec.disarm()  # eval: ends the rollout and submits it
-    rec.shutdown()
-    assert frames == n  # strict 1:1 -- one frame per action sent, no more, no fewer
-    assert rec.writer.num_episodes >= 1
-    assert rec.writer.saved_episodes[0]["frames"] == n
-
-
 def test_note_action_sent_is_a_noop_until_armed_in_eval(tmp_path):
     # Sends that arrive before arming (or in a non-eval source) must not leak into any episode.
     cfg = RecorderConfig(
@@ -420,9 +394,31 @@ def test_finish_clears_policy_action_and_latched_rollout_request():
     assert bridge._policy_action_req is None
 
 
+class _HealthyCameras:
+    """Stand-in for a CameraManager that has delivered.
+
+    `cameras.healthy` is False until every camera has produced at least one frame -- a real
+    camera has not, before its pipeline starts, and a test that never starts one would otherwise
+    record nothing. These tests are about the DAgger gate, not about sensor health, so they say
+    the sensors are up and mean it.
+    """
+
+    healthy = True
+    image_keys = ("agentview",)
+
+    @staticmethod
+    def stamps():
+        return {}
+
+    @staticmethod
+    def age_s():
+        return {}
+
+
 def test_dagger_records_one_rollout_across_interventions():
     cfg = RecorderConfig(record_source="dagger", mock=False)
     rec = Recorder(cfg)
+    rec.cameras = _HealthyCameras()
     rec.writer = _FakeWriter()
     submitted = rec.writer.saved
     rec.gate.arm()
@@ -465,6 +461,7 @@ def test_dagger_records_one_rollout_across_interventions():
 def test_dagger_discard_drops_the_complete_rollout():
     cfg = RecorderConfig(record_source="dagger", mock=False, review_before_save=False)
     rec = Recorder(cfg)
+    rec.cameras = _HealthyCameras()
     rec.writer = _FakeWriter()
     rec.gate.arm()
     images = {"agentview": np.zeros((4, 4, 3), np.uint8)}
@@ -892,7 +889,7 @@ def test_each_eval_rollout_is_its_own_episode(tmp_path):
         for rollout in range(2):
             for i in range(4):
                 rec.note_action_sent(np.full(ACTION_DIM, float(rollout * 10 + i), dtype=np.float32))
-            rec._step(rec.get_last_images(), rec.robot.get_snapshot())
+                rec._step(rec.get_last_images(), rec.robot.get_snapshot())
             assert rec.get_status()["frames"] == 4, "this rollout's own frames"
 
             rec.end_rollout()  # the runner: the policy stopped driving
@@ -953,3 +950,176 @@ def test_teleop_still_uses_the_button_map():
     rec = Recorder(RecorderConfig(record_source="teleop", mock=False))
     assert rec._button_outcome, "teleop keeps its outcome map"
     assert rec._button_outcome.get("right.0") == "discard", "the teleop map, unchanged"
+
+
+# --------------------------------------------------------------- eval records the way teleop does
+
+
+def test_nothing_is_recorded_before_the_first_action_of_a_rollout(tmp_path):
+    """The episode still starts at the first commanded action.
+
+    The ticks before it are a stationary arm waiting on the first inference -- a JAX compile is
+    tens of seconds -- and recording those with control_mode=policy is what teaches a policy to
+    hold still. Only the holds BETWEEN chunks are new.
+    """
+    cfg = RecorderConfig(
+        repo_id="test/pre", root=str(tmp_path), fps=30, mock=True, record_source="eval", review_before_save=False
+    )
+    rec = Recorder(cfg)
+    rec.cameras.start()
+    rec.robot.start()
+    rec._last_images = rec.cameras.read()
+    rec.writer = rec._open_writer()
+    rec.gate.arm()
+    try:
+        for _ in range(3):  # armed, nothing sent yet
+            rec._step(rec.get_last_images(), rec.robot.get_snapshot())
+        assert rec.get_status()["frames"] == 0
+        rec.note_action_sent(np.zeros(ACTION_DIM, dtype=np.float32))
+        rec._step(rec.get_last_images(), rec.robot.get_snapshot())
+        assert rec.get_status()["frames"] == 1
+    finally:
+        rec.shutdown()
+
+
+def test_the_sample_frame_declares_every_key_a_real_frame_carries(tmp_path):
+    """The sample frame IS the declared schema, so it has to match what _frame() emits.
+
+    LeRobot rejects an add_frame whose keys differ from the schema in EITHER direction, and it
+    rejects it per frame -- so a key added to _frame() and not to _sample_frame() does not fail at
+    open, it fails on every save and stops the writer. That is exactly what a briefly-added
+    `action_seq` column did on a brand-new dataset. This compares the two directly, so the next
+    column added to one and not the other cannot repeat it.
+    """
+    cfg = RecorderConfig(repo_id="test/schema", root=str(tmp_path), fps=30, mock=True, record_source="eval")
+    rec = Recorder(cfg)
+    rec.cameras.start()
+    rec.robot.start()
+    try:
+        sample = set(rec._sample_frame())
+        real = set(rec._frame(rec.cameras.read(), rec.robot.get_snapshot()))
+        assert real - sample == set(), f"_frame emits keys the schema does not declare: {real - sample}"
+        assert sample - real == set(), f"the schema declares keys no frame carries: {sample - real}"
+    finally:
+        rec.shutdown()
+
+
+def test_an_empty_rollout_still_resets_the_chunk_counter(tmp_path):
+    """The counter restarts at the rollout boundary whatever happened to the episode.
+
+    Three of the four end paths never reach _reset_episode: an empty rollout is skipped, a
+    discarded one and a pending one take their own routes. A counter left above zero makes the
+    NEXT rollout look already started, so it records from its first tick -- through the whole wait
+    for the first inference, which is a motionless arm during a JAX compile.
+    """
+    cfg = RecorderConfig(
+        repo_id="test/emptyseq", root=str(tmp_path), fps=30, mock=True, record_source="eval", review_before_save=False
+    )
+    rec = Recorder(cfg)
+    rec.cameras.start()
+    rec.robot.start()
+    rec._last_images = rec.cameras.read()
+    rec.writer = rec._open_writer()
+    rec.gate.arm()
+    try:
+        # a rollout that ends without ever recording a frame (the send landed, the tick did not)
+        rec.note_action_sent(np.zeros(ACTION_DIM, dtype=np.float32))
+        rec.end_rollout()
+        rec._step(rec.get_last_images(), rec.robot.get_snapshot())
+        assert rec._action_seq == 0, "an empty rollout must still restart the count"
+        # so the next rollout records nothing until its own first action
+        rec._step(rec.get_last_images(), rec.robot.get_snapshot())
+        assert rec.get_status()["frames"] == 0, "the wait before the first action is not the rollout"
+    finally:
+        rec.shutdown()
+
+
+def _eval_rec(tmp_path, name, **kw):
+    cfg = RecorderConfig(
+        repo_id=f"test/{name}",
+        root=str(tmp_path),
+        fps=30,
+        mock=True,
+        record_source="eval",
+        review_before_save=False,
+        **kw,
+    )
+    rec = Recorder(cfg)
+    rec.cameras.start()
+    rec.robot.start()
+    rec._last_images = rec.cameras.read()
+    rec.writer = rec._open_writer()
+    rec.gate.arm()
+    return rec
+
+
+def test_a_tick_with_nothing_new_records_nothing(tmp_path):
+    """A frame is written where the rollout ADVANCED, not on every tick.
+
+    Two ways a tick carries nothing: the policy is inferring so no action was sent, or the camera
+    has not produced a new image since the last recorded frame (the loop paces at cfg.fps and can
+    outrun the sensor -- which is what made the first chunks a repeated first frame). Both are
+    dropped and both are counted.
+    """
+    rec = _eval_rec(tmp_path, "nothingnew")
+    try:
+        rec.note_action_sent(np.zeros(ACTION_DIM, dtype=np.float32))
+        for _ in range(5):  # one send, five ticks: the four holds contribute nothing
+            rec._step(rec.get_last_images(), rec.robot.get_snapshot())
+        assert rec.get_status()["frames"] == 1
+        assert rec._skipped["hold"] == 4, rec._skipped
+    finally:
+        rec.shutdown()
+
+
+def test_record_holds_keeps_the_inference_gap(tmp_path):
+    """The other side of the trade, kept available: with record_holds the elapsed time is real."""
+    rec = _eval_rec(tmp_path, "holds", record_holds=True)
+    try:
+        rec.note_action_sent(np.zeros(ACTION_DIM, dtype=np.float32))
+        for _ in range(5):
+            rec._step(rec.get_last_images(), rec.robot.get_snapshot())
+        assert rec.get_status()["frames"] == 5
+        assert rec._skipped["hold"] == 0
+    finally:
+        rec.shutdown()
+
+
+def test_a_sensor_gap_is_counted_separately_from_a_hold(tmp_path):
+    """A missing sensor is not the same event as the policy thinking, and the log says which."""
+    rec = _eval_rec(tmp_path, "gap")
+    try:
+        rec.note_action_sent(np.zeros(ACTION_DIM, dtype=np.float32))
+        snap = rec.robot.get_snapshot()
+        rec._step(rec.get_last_images(), snap)  # records
+        rec.note_action_sent(np.zeros(ACTION_DIM, dtype=np.float32))
+        blind = dict(snap)
+        blind["state"] = None  # the robot stopped reporting for one tick
+        rec._step(rec.get_last_images(), blind)
+        assert rec.get_status()["frames"] == 1, "the blind tick must not become a frame"
+        assert rec._skipped["state"] == 1, rec._skipped
+        assert rec._skipped["hold"] == 0, rec._skipped
+    finally:
+        rec.shutdown()
+
+
+def test_the_send_counter_restarts_each_rollout(tmp_path):
+    """The counter gates recording, so it has to restart with the rollout.
+
+    It is not a column -- the runner infers on every control tick, so it counts sends rather than
+    chunks, and with holds dropped it would only restate the frame index. What it decides is
+    whether a tick has anything new, and a value carried over from the previous rollout makes the
+    next one look already started through the whole wait for its first inference.
+    """
+    rec = _eval_rec(tmp_path, "seqreset")
+    try:
+        rec.note_action_sent(np.zeros(ACTION_DIM, dtype=np.float32))
+        rec._step(rec.get_last_images(), rec.robot.get_snapshot())
+        assert rec.get_status()["frames"] == 1
+        rec.end_rollout()
+        rec._step(rec.get_last_images(), rec.robot.get_snapshot())
+        assert rec._action_seq == 0
+        rec._step(rec.get_last_images(), rec.robot.get_snapshot())
+        assert rec.get_status()["frames"] == 0, "the wait before the first action is not the rollout"
+    finally:
+        rec.shutdown()

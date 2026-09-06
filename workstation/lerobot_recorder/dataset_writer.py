@@ -67,10 +67,7 @@ def list_datasets(root: str) -> List[str]:
     Sorted; [] when the root doesn't exist."""
     path = os.path.expanduser(root)
     try:
-        return sorted(
-            d for d in os.listdir(path)
-            if not d.startswith(".") and os.path.isdir(os.path.join(path, d))
-        )
+        return sorted(d for d in os.listdir(path) if not d.startswith(".") and os.path.isdir(os.path.join(path, d)))
     except OSError:
         return []
 
@@ -131,8 +128,13 @@ def remove_dataset_root(root: str) -> None:
 class AsyncDatasetWriter:
     """Queued episode writer. ``submit()`` returns immediately; a worker saves."""
 
-    def __init__(self, cfg: RecorderConfig, image_keys: List[str], image_shapes: Dict[str, tuple],
-                 extra_features: Optional[Dict[str, tuple]] = None) -> None:
+    def __init__(
+        self,
+        cfg: RecorderConfig,
+        image_keys: List[str],
+        image_shapes: Dict[str, tuple],
+        extra_features: Optional[Dict[str, tuple]] = None,
+    ) -> None:
         self.cfg = cfg
         self.image_keys = image_keys
         self.image_shapes = image_shapes
@@ -147,6 +149,9 @@ class AsyncDatasetWriter:
         self._abcdl = str(getattr(cfg, "record_format", "lerobot")).lower() == "abcdl"
         self._ds = None
         self._features: Optional[dict] = None
+        #: Columns this build writes that a resumed dataset does not declare; dropped per frame.
+        #: See _note_undeclared_features.
+        self._drop_keys: set = set()
         self._active_episode_frames: Optional[List[dict]] = None
         self._pyav_encode_temporary = None
         if not self._mock and not self._abcdl:
@@ -490,10 +495,15 @@ class AsyncDatasetWriter:
             return
         try:
             os.makedirs(self._root, exist_ok=True)
-            json.dump({"rl_features": bool(getattr(self.cfg, "rl_features", False)),
-                       "reward_mode": getattr(self.cfg, "reward_mode", "sparse"),
-                       "discount_factor": float(getattr(self.cfg, "discount_factor", 0.99))},
-                      open(path, "w"), indent=2)
+            json.dump(
+                {
+                    "rl_features": bool(getattr(self.cfg, "rl_features", False)),
+                    "reward_mode": getattr(self.cfg, "reward_mode", "sparse"),
+                    "discount_factor": float(getattr(self.cfg, "discount_factor", 0.99)),
+                },
+                open(path, "w"),
+                indent=2,
+            )
         except Exception as e:
             logger.error("could not write rl_config.json: %s", e)
 
@@ -506,7 +516,8 @@ class AsyncDatasetWriter:
         except ImportError as e:
             raise RuntimeError("rl_features needs the abcdl package — pip install -e '.[abcdl]'") from e
         return compute_frame_features(
-            n_frames, success=(outcome == "success"),
+            n_frames,
+            success=(outcome == "success"),
             mode=getattr(self.cfg, "reward_mode", "sparse"),
             discount=float(getattr(self.cfg, "discount_factor", 0.99)),
         )
@@ -529,14 +540,17 @@ class AsyncDatasetWriter:
             os.makedirs(self._root, exist_ok=True)
             if self.cfg.resume and os.path.isdir(self._root):
                 self._n_episodes = sum(
-                    1 for d in os.listdir(self._root)
-                    if d.startswith("episode_")
-                    and os.path.exists(os.path.join(self._root, d, "states_actions.bin"))
+                    1
+                    for d in os.listdir(self._root)
+                    if d.startswith("episode_") and os.path.exists(os.path.join(self._root, d, "states_actions.bin"))
                 )
                 logger.info("abcdl dataset resuming at %s (%d episodes)", self._root, self._n_episodes)
             else:
-                logger.info("abcdl dataset at %s (format=abcdl, size=%d)",
-                            self._root, int(getattr(self.cfg, "abcdl_size", 224)))
+                logger.info(
+                    "abcdl dataset at %s (format=abcdl, size=%d)",
+                    self._root,
+                    int(getattr(self.cfg, "abcdl_size", 224)),
+                )
             self._initial_episodes = self._n_episodes  # authoritative pre-session count
             self._outcome_totals = self._read_outcome_totals()
             self._worker = threading.Thread(target=self._run, daemon=True)
@@ -556,8 +570,7 @@ class AsyncDatasetWriter:
                     with open(info_path) as fh:
                         local_info = json.load(fh)
                     empty_local = (
-                        int(local_info.get("total_episodes", 0)) == 0
-                        and int(local_info.get("total_frames", 0)) == 0
+                        int(local_info.get("total_episodes", 0)) == 0 and int(local_info.get("total_frames", 0)) == 0
                     )
                     if not empty_local and _outcomes.predates_outcome_schema(self._root):
                         # Appending to a dataset that predates the outcome columns would produce a
@@ -581,6 +594,7 @@ class AsyncDatasetWriter:
                 LeRobotDataset = _import_lerobot_dataset()
                 enc = self._fit_encoding_kwargs(self._dataset_encoding_kwargs(), LeRobotDataset.__init__)
                 self._ds = LeRobotDataset(self.cfg.repo_id, root=self._root, **enc)
+                self._note_undeclared_features()
                 self._n_episodes = int(
                     getattr(self._ds, "num_episodes", getattr(getattr(self._ds, "meta", None), "total_episodes", 0))
                 )
@@ -600,7 +614,10 @@ class AsyncDatasetWriter:
                     self._ds.clear_episode_buffer(delete_images=True)
                 logger.info(
                     "dataset resuming at %s (%d existing episodes, vcodec=%s, batch=%s)",
-                    self._root, self._n_episodes, self.cfg.vcodec, self.cfg.batch_encoding_size,
+                    self._root,
+                    self._n_episodes,
+                    self.cfg.vcodec,
+                    self.cfg.batch_encoding_size,
                 )
             else:
                 LeRobotDataset = _import_lerobot_dataset()
@@ -616,7 +633,10 @@ class AsyncDatasetWriter:
                 )
                 logger.info(
                     "dataset created at %s (repo_id=%s, vcodec=%s, batch=%s)",
-                    self._root, self.cfg.repo_id, self.cfg.vcodec, self.cfg.batch_encoding_size,
+                    self._root,
+                    self.cfg.repo_id,
+                    self.cfg.vcodec,
+                    self.cfg.batch_encoding_size,
                 )
             self._configure_torchcodec_encoder()
             self._apply_gop()
@@ -651,7 +671,8 @@ class AsyncDatasetWriter:
             if result["moved"]:
                 logger.warning(
                     "moved %d item(s) to %s — committed episodes are untouched",
-                    len(result["moved"]), result["quarantine"],
+                    len(result["moved"]),
+                    result["quarantine"],
                 )
         except Exception as e:
             logger.error("crash recovery skipped: %s", e)
@@ -746,7 +767,7 @@ class AsyncDatasetWriter:
         wants it on every ``add_frame`` and by the time the episode ends its frames are already
         inside the dataset. Taking it from the frame dict instead -- which carries no task --
         silently wrote an empty string for every streamed episode.
-        
+
 
         The point of this path is that no episode is ever held whole in memory. Three cameras
         at 640x480 are ~2.8 MB a frame, so a 40 s episode buffered as a list is ~7 GB -- enough
@@ -762,9 +783,7 @@ class AsyncDatasetWriter:
         self._frame_queue.put(("frame", frame, task))
 
     def end_episode(self, outcome: Optional[str], task: str) -> None:
-        """Close the streamed episode and save it.
-
-        """
+        """Close the streamed episode and save it."""
         self._check_writable()
         self._frame_queue.put(("end", outcome, task))
         with self._lock:
@@ -882,10 +901,39 @@ class AsyncDatasetWriter:
                     self._saving_frames = 0
                 self._queue.task_done()
 
+    def _note_undeclared_features(self) -> None:
+        """On resume, find the columns this build would write that the dataset does not declare.
+
+        LeRobot rejects an add_frame whose keys differ from the declared schema in EITHER direction,
+        and it rejects it per frame -- so a recorder that gained a column since the dataset was
+        created does not fail at open, it fails on every save and the writer stops. That is how a
+        new `action_seq` turned a rollout into a wall of identical errors.
+
+        The dataset's schema wins: a column it never declared cannot be added without rewriting it,
+        and dropping the column costs one diagnostic while refusing to record costs the session. So
+        the extras are dropped, once, loudly, naming both the column and the fix.
+        """
+        self._drop_keys = set()
+        declared = getattr(getattr(self._ds, "meta", None), "features", None) or getattr(self._ds, "features", None)
+        if not declared or not self._features:
+            return
+        extra = {k for k in self._features if k not in declared}
+        if not extra:
+            return
+        self._drop_keys = extra
+        logger.warning(
+            "%s was created before this recorder had %s, so %s will NOT be recorded into it. "
+            "Everything else is unaffected. Record into a new --repo-id to get the column, or "
+            "migrate the dataset if you need it on the existing episodes.",
+            self._root,
+            ", ".join(sorted(extra)),
+            "they" if len(extra) > 1 else "it",
+        )
+
     def _to_lerobot_frame(self, f: dict, task: str, extra: Optional[dict] = None) -> dict:
         frame = {f"observation.images.{k}": v for k, v in f["images"].items()}
         for key, val in f.items():
-            if key in ("images", "task"):
+            if key in ("images", "task") or key in self._drop_keys:
                 continue
             array = np.asarray(val, dtype=np.float32)
             # Declared extras go in at their declared shape; they travel flattened so nothing
@@ -961,7 +1009,9 @@ class AsyncDatasetWriter:
             self._ds.clear_episode_buffer()
             logger.warning(
                 "LOW DISK: %.1f GB free (< %s GB) — %d streamed frame(s) DISCARDED",
-                free, self.cfg.min_free_gb, n_frames,
+                free,
+                self.cfg.min_free_gb,
+                n_frames,
             )
             with self._lock:
                 self._saving_frames = 0
@@ -1026,7 +1076,7 @@ class AsyncDatasetWriter:
                     for i, f in enumerate(frames):
                         frame = {f"observation.images.{k}": v for k, v in f["images"].items()}
                         for key, val in f.items():
-                            if key in ("images", "task"):
+                            if key in ("images", "task") or key in self._drop_keys:
                                 continue
                             frame[key] = np.asarray(val, dtype=np.float32)
                         if ff:
@@ -1084,11 +1134,14 @@ class AsyncDatasetWriter:
                 vkey = f"observation.images.{key}"
                 if f"videos/{vkey}/to_timestamp" not in latest:
                     continue
-                path = os.path.join(meta.root, meta.video_path.format(
-                    video_key=vkey,
-                    chunk_index=int(_scalar(latest[f"videos/{vkey}/chunk_index"])),
-                    file_index=int(_scalar(latest[f"videos/{vkey}/file_index"])),
-                ))
+                path = os.path.join(
+                    meta.root,
+                    meta.video_path.format(
+                        video_key=vkey,
+                        chunk_index=int(_scalar(latest[f"videos/{vkey}/chunk_index"])),
+                        file_index=int(_scalar(latest[f"videos/{vkey}/file_index"])),
+                    ),
+                )
                 claimed = int(round(float(_scalar(latest[f"videos/{vkey}/to_timestamp"])) * fps))
                 actual = video_frame_count(path)
                 if actual is None or actual >= claimed:
@@ -1100,7 +1153,11 @@ class AsyncDatasetWriter:
                     "metadata expects %d. Later episodes in this file are now misaligned and the "
                     "dataset will raise 'IndexError: Invalid frame index' when loaded. It is "
                     "auto-repaired when you stop recording; if this keeps happening, %s",
-                    episode_index, key, os.path.basename(path), actual, claimed,
+                    episode_index,
+                    key,
+                    os.path.basename(path),
+                    actual,
+                    claimed,
                     self._encoder_remedy(),
                 )
         except Exception as e:
@@ -1115,8 +1172,9 @@ class AsyncDatasetWriter:
             return "try recorder.encoding_backend: pyav in config.yaml."
         return "set recorder.vcodec: h264 in config.yaml (CPU encode; slower but reliable)."
 
-    def _save_episode_abcdl(self, frames: List[dict], task: str, ep_index: int,
-                            frame_features: Optional[dict] = None) -> None:
+    def _save_episode_abcdl(
+        self, frames: List[dict], task: str, ep_index: int, frame_features: Optional[dict] = None
+    ) -> None:
         """Write one episode as an abcdl dir via abcdl.EpisodeWriter (images square-resized)."""
         import cv2
 
@@ -1128,15 +1186,15 @@ class AsyncDatasetWriter:
         size = int(getattr(self.cfg, "abcdl_size", 224))
         out_dir = os.path.join(self._root, f"episode_{ep_index:06d}")
         tick = int(1e9 / max(1, int(self.cfg.fps)))
-        w = EpisodeWriter(out_dir, formats=("abcdl",), fps=int(self.cfg.fps),
-                          cameras=list(self.image_keys))
+        w = EpisodeWriter(out_dir, formats=("abcdl",), fps=int(self.cfg.fps), cameras=list(self.image_keys))
         for i, f in enumerate(frames):
             imgs = {
                 k: cv2.resize(np.asarray(v), (size, size), interpolation=cv2.INTER_AREA)
                 for k, v in f["images"].items()
             }
-            w.add_frame(i * tick, np.asarray(f["observation.state"], np.float64),
-                        np.asarray(f["action"], np.float64), imgs)
+            w.add_frame(
+                i * tick, np.asarray(f["observation.state"], np.float64), np.asarray(f["action"], np.float64), imgs
+            )
         w.save(task=task, frame_features=frame_features)
 
     def _record_outcome(self, episode_index: int, outcome: Optional[str], task: str, n_frames: int) -> None:
@@ -1229,8 +1287,10 @@ class AsyncDatasetWriter:
                     "which would raise 'IndexError: Invalid frame index' when this dataset is "
                     "loaded. Repairing now; if this recurs, %s",
                     len(short),
-                    ", ".join(f"{s['video_key'].split('.')[-1]} file-{s['file']:03d} "
-                              f"({s['actual']}/{s['claimed']} frames)" for s in short),
+                    ", ".join(
+                        f"{s['video_key'].split('.')[-1]} file-{s['file']:03d} ({s['actual']}/{s['claimed']} frames)"
+                        for s in short
+                    ),
                     sum(s["missing"] for s in short),
                     self._encoder_remedy(),
                 )
@@ -1238,14 +1298,19 @@ class AsyncDatasetWriter:
                     if r["status"] == "repaired":
                         logger.warning(
                             "repaired %s file-%03d: realigned %d episode(s) %s, appended %d frame(s)",
-                            r["video_key"].split(".")[-1], r["file"], len(r["shifted_episodes"]),
-                            r["shifted_episodes"], r["appended_frames"],
+                            r["video_key"].split(".")[-1],
+                            r["file"],
+                            len(r["shifted_episodes"]),
+                            r["shifted_episodes"],
+                            r["appended_frames"],
                         )
                     else:
                         logger.error(
                             "COULD NOT repair %s file-%03d (%s) — episodes %s will fail to load; "
                             "run: workstation/yam-data check-videos --fix",
-                            r["video_key"].split(".")[-1], r["file"], r.get("error", r["status"]),
+                            r["video_key"].split(".")[-1],
+                            r["file"],
+                            r.get("error", r["status"]),
                             r["overrun_episodes"],
                         )
 
@@ -1258,7 +1323,10 @@ class AsyncDatasetWriter:
                 "video/length mismatch on %d episode(s) %s (cameras: %s) — the video encoder "
                 "dropped a trailing frame. Repairing metadata so the dataset stays editable; "
                 "if this recurs often, %s",
-                len(eps), eps, ", ".join(cams), self._encoder_remedy(),
+                len(eps),
+                eps,
+                ", ".join(cams),
+                self._encoder_remedy(),
             )
             n = repair_length_consistency(self._root)
             logger.warning("repaired %d episode-video length field(s) to match frame length", n)

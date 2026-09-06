@@ -114,6 +114,18 @@ class Recorder:
         # images/state/extras and made the first chunk render as a frozen fan). deque.append/popleft
         # are individually atomic in CPython, so no lock is needed across the two threads.
         self._sent_frames: "collections.deque[dict]" = collections.deque()
+        #: Sends the runner has reported since the last record tick, and the running count of them
+        #: this rollout. Written on the runner's thread, read on the record loop. NOT a column: the
+        #: runner calls on_action_sent once per CONTROL TICK (deploy_runner._loop infers every
+        #: iteration), not once per chunk, and with holds dropped every recorded frame has a fresh
+        #: send -- so the value would just be the frame index again. It exists to answer "did
+        #: anything new arrive since the last frame", which is the whole record gate.
+        self._pending_sends = 0
+        self._action_seq = 0
+        self._worst_image_age = 0.0  # see _note_image_age
+        self._skipped = {"camera": 0, "state": 0, "action": 0, "repeat": 0, "hold": 0}
+        self._last_recorded_seq = 0
+        self._last_recorded_stamps: dict = {}
         self._preview: List[np.ndarray] = []  # downsampled review frames
         self._btn_prev: Dict[str, list] = {}
         self._btn_outcome: Optional[str] = None  # outcome chosen via a leader button this episode
@@ -354,6 +366,52 @@ class Recorder:
                 "recording extra per-step features: %s", ", ".join(f"{k}{v}" for k, v in self._extra_features.items())
             )
 
+    def _note_image_age(self) -> None:
+        """Track the worst staleness of an image paired with an action, for the episode log.
+
+        The recorder pairs the LATEST cached camera frame with the current snapshot, so an image
+        can be up to one camera period old, and two consecutive ticks inside one period get the
+        SAME image -- a freeze in the video with a moving action beside it. That is teleop's
+        behaviour too, and this recording deliberately matches teleop, so the number is reported
+        rather than corrected. A log line, not a column: adding a field would change the schema
+        and stop the writer from appending to any eval dataset recorded before it.
+        """
+        try:
+            ages = self.cameras.age_s()
+        except Exception:
+            return
+        if ages:
+            self._worst_image_age = max(self._worst_image_age, max(ages.values()))
+
+    def _camera_stamps(self) -> dict:
+        try:
+            return self.cameras.stamps()
+        except Exception:
+            return {}
+
+    def _images_are_new(self) -> bool:
+        """Has any camera delivered a frame since the last one this episode recorded?
+
+        True in mock (no stamps) and true for the first frame of an episode, so the guard only ever
+        removes a genuine repeat.
+        """
+        now = self._camera_stamps()
+        if not now or not self._last_recorded_stamps:
+            return True
+        return any(t > self._last_recorded_stamps.get(k, -1.0) for k, t in now.items())
+
+    def _drain_sent_marks(self) -> None:
+        """Fold the sends that happened since the last tick into `action_seq`.
+
+        Read on the record loop, incremented on the runner's thread. Several sends can land inside
+        one tick when the control rate is above the record rate; the counter absorbs all of them, so
+        `action_seq` still increases monotonically and a jump of more than one says the recorder was
+        sampling slower than the robot was being driven -- which is worth seeing rather than hiding.
+        """
+        with self._lock:
+            n, self._pending_sends = self._pending_sends, 0
+        self._action_seq += n
+
     def _extra_values(self) -> Dict[str, np.ndarray]:
         """This frame's extras, zero-filled when the policy did not send one.
 
@@ -399,6 +457,8 @@ class Recorder:
 
     def _submit(self, outcome: Optional[str]) -> None:
         """Close the episode out to the writer and update live stats."""
+        self._log_image_age_after_episode()
+        self._log_skipped_after_episode()
         self._log_ram_after_episode(self._n_frames)
         writer = self._ensure_writer_open()
         if self._streaming_episode:
@@ -426,6 +486,15 @@ class Recorder:
         self._n_frames = 0
         self._streaming_episode = False
         self._sent_frames.clear()  # drop any frames not yet drained; a new episode starts empty
+        # Chunk numbering is per episode: a rollout's first chunk is 0 whichever rollout it is.
+        with self._lock:
+            self._pending_sends = 0
+        self._action_seq = 0
+        #: Worst image staleness seen while recording this episode, reported when it ends.
+        self._worst_image_age = 0.0
+        self._skipped = {"camera": 0, "state": 0, "action": 0, "repeat": 0, "hold": 0}
+        self._last_recorded_seq = 0
+        self._last_recorded_stamps = {}
 
     def shutdown(self) -> None:
         self._stop.set()
@@ -518,39 +587,29 @@ class Recorder:
         logger.info("eval rollout ended — episode closed (still armed for the next one)")
 
     def note_action_sent(self, action: np.ndarray) -> None:
-        """The runner calls this from its control-rate thread the instant it sends an action to the
-        robot (see DeploymentPolicyRunner.on_action_sent). It captures the WHOLE frame right now --
-        the latest camera images, the current robot snapshot, this action, and the policy's per-step
-        extras (action_samples), all from the same instant -- and queues it; the record loop then
-        writes one frame per sent action, so recorded frames == executed actions AND each frame is
-        internally consistent. Capturing here rather than at drain time is deliberate: it stops a
-        lagging record loop from collapsing several sends onto one stale snapshot.
+        """The runner calls this the instant it sends an action to the robot. It no longer captures
+        a frame; it MARKS one.
 
-        A no-op unless armed in eval mode and the sensors are ready: pre-arm/idle sends and sends
-        while cameras/state are not yet healthy (or during a recentre pause) are dropped rather than
-        recorded as a junk frame -- there is nothing coherent to capture then. Extras are read via
-        get_extras(); this runs right after the runner's own _set_extras() on the same thread, so it
-        sees exactly this step's extras."""
+        This used to build the whole frame here, and the record loop wrote one per call. That made
+        recorded frames == executed actions, and made the recording's time axis a fiction: nothing
+        is sent while the policy is inferring, so the hold left no frames, and LeRobot's
+        timestamp = frame_index / fps replayed it as no time at all. The loop now samples at a fixed
+        rate exactly as teleop does (see _step), which is also the convention every training episode
+        was recorded under.
+
+        The counter it bumps is the record gate: a tick with no new send is the policy inferring,
+        and with cfg.record_holds off that tick contributes no frame. It is deliberately NOT a
+        dataset column. The runner infers on every control tick, so this counts sends and not
+        chunks, and once holds are dropped every recorded frame has its own send -- the column
+        would have restated the frame index. The real chunk boundary lives in the runner
+        (_note_chunk / _last_chunk_index) and belongs there.
+
+        A no-op unless armed in eval mode, for the same reason as before: a mark outside a rollout
+        belongs to nothing."""
         if not (self._eval and self.gate.armed):
             return
-        if not self.cameras.healthy:
-            return
-        snap = self.robot.get_snapshot()
-        if snap.get("state") is None or snap.get("leader_recentering"):
-            return
-        # Homing is not part of the rollout. The runner already stops streaming once the robot
-        # reports it (which covers the gripper release -- the controller raises `homing` for the
-        # whole release/travel/close sequence), but `homing` can turn true between that check and
-        # this capture, which is how a single frame of the homing pose reached the end of a
-        # recording. Re-checking here closes that window: an episode ends on the last action the
-        # policy drove, not on the arm going home.
-        if snap.get("homing") or snap.get("teleop_state") == "HOMING":
-            return
-        images = self.get_last_images()
-        if not images:
-            return
-        frame = self._frame(images, snap, action=np.asarray(action, dtype=np.float32).reshape(-1))
-        self._sent_frames.append(frame)
+        with self._lock:
+            self._pending_sends += 1
 
     def set_intervention(self, flag: bool) -> None:
         """Forward a DAgger human-intervention request."""
@@ -655,6 +714,28 @@ class Recorder:
             return sum(int(np.prod(s)) for s in shapes) / 1e6
         except Exception:
             return 0.0
+
+    def _log_skipped_after_episode(self) -> None:
+        """Ticks that fell inside the rollout but produced no frame, and why."""
+        total = sum(self._skipped.values())
+        if not total:
+            return
+        logger.info(
+            "%d tick(s) inside this rollout recorded no frame (%s). repeat = the camera had not "
+            "produced a new image; hold = the policy was inferring and nothing was sent. Both are "
+            "dropped on purpose (record_holds=False); the others are sensor gaps.",
+            total,
+            ", ".join(f"{k}: {v}" for k, v in self._skipped.items() if v),
+        )
+
+    def _log_image_age_after_episode(self) -> None:
+        """What the worst image staleness was, next to the frame count it applies to."""
+        if self._worst_image_age > 0:
+            logger.info(
+                "worst image age paired with an action this episode: %.0f ms "
+                "(the recorder samples the latest cached frame, as teleop does)",
+                1000 * self._worst_image_age,
+            )
 
     def _log_ram_after_episode(self, frames: int) -> None:
         """The other half of the pair: what the episode actually cost."""
@@ -771,20 +852,95 @@ class Recorder:
                 self._rollout_ended = False
                 if not self._ep_empty():
                     self._end_eval_rollout()
+                # The chunk counter restarts at the ROLLOUT boundary, always -- not as a side
+                # effect of _reset_episode, which three of the four end paths never reach: an
+                # empty rollout is skipped here, and review_before_save parks the episode pending
+                # instead of submitting it. A counter left above zero makes the NEXT rollout look
+                # already started, so it records from its first tick -- through the whole wait for
+                # the first inference, a JAX compile of tens of seconds of a motionless arm. That
+                # is the "saves everything including the server wait" report, and it is what the
+                # `started` guard exists to prevent.
+                with self._lock:
+                    self._pending_sends = 0
+                self._action_seq = 0
+                self._last_recorded_seq = 0
+                self._last_recorded_stamps = {}
 
-            # Drain the frames note_action_sent already captured (one per action the runner sent).
-            # They are complete, self-consistent snapshots taken at send time -- held "waiting for
-            # inference" ticks and paused ticks send nothing, so they contribute nothing. Writing
-            # here keeps all episode-buffer/writer mutation on this single thread (the runner only
-            # appends to the deque). If the gate is closed or paused, drop whatever is queued rather
-            # than fold it into a stale episode.
-            if self.gate.armed and not recording_paused:
-                while self._sent_frames:
-                    frame = self._sent_frames.popleft()
-                    self._ep_add(frame)
-                    self._buffer_preview(frame["images"])
+            # ONE FRAME PER TICK, exactly like teleop -- not one per action the runner sent.
+            #
+            # Send-driven capture guaranteed "recorded frames == executed actions", and paid for it
+            # with a recording that has no time base: no action is sent while the policy is
+            # inferring, so no frame existed for that stretch, while LeRobot writes
+            # timestamp = frame_index / fps regardless. A 150 ms hold was therefore replayed as 0 ms
+            # and the motion tore. Consecutive sends inside one camera period also reused the same
+            # cached image, which reads as a freeze followed by a jump at every chunk boundary.
+            #
+            # The fix is to record the way the TRAINING data was recorded. The policy and the critic
+            # were both fitted on teleop episodes, which are fixed-rate samples of (latest camera
+            # frame, current robot snapshot); a rollout sampled differently is a rollout drawn from
+            # a different distribution than anything was trained on. And it costs nothing here,
+            # because the snapshot's `action` in eval mode is already `_fuse(sides, ("applied",))`
+            # -- the action the robot reports it applied, the same field teleop records.
+            #
+            # What the send stream still contributes is the chunk boundary: `action_seq` counts
+            # sends, so a held frame and a fresh one are told apart at analysis time without the
+            # recording having to drop the held ones.
+            # Homing is not part of the rollout. The runner stops streaming once the robot reports
+            # it, but `homing` can turn true between that check and this tick, which is how a frame
+            # of the homing pose once reached the end of a recording.
+            homing = bool(snap.get("homing")) or snap.get("teleop_state") == "HOMING"
+            if self.gate.armed and not recording_paused and not homing:
+                self._drain_sent_marks()
+                # An episode still STARTS at the first commanded action, as it did under
+                # send-driven capture. The ticks before it are a stationary arm waiting on the
+                # first inference -- a JAX compile is tens of seconds -- and recording those with
+                # control_mode=policy is the "teaches the policy to do nothing" failure the bridge
+                # already guards against for DAgger. What changed is only what happens AFTER the
+                # first send: the holds between chunks are now recorded instead of vanishing.
+                started = self._action_seq > 0
+                # Two ways a tick carries nothing new, both of which the recording should skip
+                # unless record_holds says otherwise.
+                #
+                # STALE IMAGE. The loop paces itself at cfg.fps while the cameras run at their own
+                # rate, so a tick can read a frame it already read -- _loop says so in as many
+                # words. Those frames are literally the previous picture with a later index, which
+                # is the "first few chunks are a repeated first frame" report; they cluster at the
+                # start of the first rollout because that is when the sensors are slowest to settle.
+                #
+                # NO NEW ACTION. Nothing is sent while the policy is inferring, so the arm is
+                # holding the last command. Keeping those frames makes elapsed time real in the
+                # video; dropping them keeps the recording to the part of the rollout that moved.
+                fresh_image = self._images_are_new()
+                fresh_action = self._action_seq > self._last_recorded_seq
+                hold = not (fresh_action or self.cfg.record_holds)
+                if started and not fresh_image:
+                    self._skipped["repeat"] += 1
+                elif started and hold:
+                    self._skipped["hold"] += 1
+                elif started:
+                    # A dropped tick is a HOLE in a fixed-rate recording: the frames either side of
+                    # it are further apart in reality than timestamp = index/fps says, which is the
+                    # same lie this change exists to remove. cameras.healthy is all-or-nothing
+                    # across cameras, so one camera's hiccup drops the whole frame, and at a
+                    # rollout's start the sensor warm-up can drop the first chunk outright.
+                    # Counted by reason and reported when the episode ends, because "the first
+                    # chunks did not save" should not need a code read to diagnose.
+                    if not self.cameras.healthy:
+                        self._skipped["camera"] += 1
+                    elif snap["state"] is None:
+                        self._skipped["state"] += 1
+                    elif snap["action"] is None:
+                        self._skipped["action"] += 1
+                    else:
+                        self._note_image_age()
+                        self._last_recorded_seq = self._action_seq
+                        self._last_recorded_stamps = self._camera_stamps()
+                        frame = self._frame(images, snap)
+                        self._ep_add(frame)
+                        self._buffer_preview(frame["images"])
             else:
                 self._sent_frames.clear()
+                self._action_seq = 0
             self._set(
                 armed=self.gate.armed,
                 recording=self.gate.armed and not recording_paused,
