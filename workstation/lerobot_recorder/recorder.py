@@ -119,6 +119,7 @@ class Recorder:
         self._pending_sends = 0
         self._action_seq = 0
         self._worst_image_age = 0.0  # see _note_image_age
+        self._skipped = {"camera": 0, "state": 0, "action": 0}  # see _log_skipped_after_episode
         self._preview: List[np.ndarray] = []  # downsampled review frames
         self._btn_prev: Dict[str, list] = {}
         self._btn_outcome: Optional[str] = None  # outcome chosen via a leader button this episode
@@ -434,6 +435,7 @@ class Recorder:
     def _submit(self, outcome: Optional[str]) -> None:
         """Close the episode out to the writer and update live stats."""
         self._log_image_age_after_episode()
+        self._log_skipped_after_episode()
         self._log_ram_after_episode(self._n_frames)
         writer = self._ensure_writer_open()
         if self._streaming_episode:
@@ -467,6 +469,7 @@ class Recorder:
         self._action_seq = 0
         #: Worst image staleness seen while recording this episode, reported when it ends.
         self._worst_image_age = 0.0
+        self._skipped = {"camera": 0, "state": 0, "action": 0}
 
     def shutdown(self) -> None:
         self._stop.set()
@@ -686,6 +689,18 @@ class Recorder:
         except Exception:
             return 0.0
 
+    def _log_skipped_after_episode(self) -> None:
+        """Ticks that fell inside the rollout but produced no frame, and why."""
+        total = sum(self._skipped.values())
+        if not total:
+            return
+        logger.warning(
+            "%d tick(s) inside this rollout recorded no frame (%s) -- the recording is that many "
+            "frames short of the time it covers",
+            total,
+            ", ".join(f"{k}: {v}" for k, v in self._skipped.items() if v),
+        )
+
     def _log_image_age_after_episode(self) -> None:
         """What the worst image staleness was, next to the frame count it applies to."""
         if self._worst_image_age > 0:
@@ -847,11 +862,25 @@ class Recorder:
                 # already guards against for DAgger. What changed is only what happens AFTER the
                 # first send: the holds between chunks are now recorded instead of vanishing.
                 started = self._action_seq > 0
-                if started and snap["state"] is not None and snap["action"] is not None and self.cameras.healthy:
-                    self._note_image_age()
-                    frame = self._frame(images, snap)
-                    self._ep_add(frame)
-                    self._buffer_preview(frame["images"])
+                if started:
+                    # A dropped tick is a HOLE in a fixed-rate recording: the frames either side of
+                    # it are further apart in reality than timestamp = index/fps says, which is the
+                    # same lie this change exists to remove. cameras.healthy is all-or-nothing
+                    # across cameras, so one camera's hiccup drops the whole frame, and at a
+                    # rollout's start the sensor warm-up can drop the first chunk outright.
+                    # Counted by reason and reported when the episode ends, because "the first
+                    # chunks did not save" should not need a code read to diagnose.
+                    if not self.cameras.healthy:
+                        self._skipped["camera"] += 1
+                    elif snap["state"] is None:
+                        self._skipped["state"] += 1
+                    elif snap["action"] is None:
+                        self._skipped["action"] += 1
+                    else:
+                        self._note_image_age()
+                        frame = self._frame(images, snap)
+                        self._ep_add(frame)
+                        self._buffer_preview(frame["images"])
             else:
                 self._sent_frames.clear()
                 self._action_seq = 0

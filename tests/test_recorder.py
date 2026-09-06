@@ -1064,3 +1064,33 @@ def test_action_seq_restarts_each_rollout(tmp_path):
         assert [int(f["action_seq"][0]) for f in _in_flight(rec)] == [1]
     finally:
         rec.shutdown()
+
+
+def test_a_tick_that_records_nothing_is_counted_not_swallowed(tmp_path):
+    """A dropped tick is a hole in a fixed-rate recording, so it has to be visible.
+
+    cameras.healthy is all-or-nothing across cameras: one camera's hiccup drops the whole frame,
+    and at a rollout's start the sensor warm-up can drop the first chunk outright -- which is what
+    "the first one or two chunks did not save" looks like from the outside. The count and the
+    reason go in the episode log.
+    """
+    cfg = RecorderConfig(
+        repo_id="test/skip", root=str(tmp_path), fps=30, mock=True, record_source="eval", review_before_save=False
+    )
+    rec = Recorder(cfg)
+    rec.cameras.start()
+    rec.robot.start()
+    rec._last_images = rec.cameras.read()
+    rec.writer = rec._open_writer()
+    rec.gate.arm()
+    try:
+        rec.note_action_sent(np.zeros(ACTION_DIM, dtype=np.float32))
+        snap = rec.robot.get_snapshot()
+        rec._step(rec.get_last_images(), snap)  # a good tick
+        blind = dict(snap)
+        blind["state"] = None  # the robot stopped reporting for one tick
+        rec._step(rec.get_last_images(), blind)
+        assert rec.get_status()["frames"] == 1, "the blind tick must not become a frame"
+        assert rec._skipped["state"] == 1, rec._skipped
+    finally:
+        rec.shutdown()
