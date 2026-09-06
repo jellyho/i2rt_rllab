@@ -264,6 +264,19 @@ class CameraManager:
             except Exception as e:
                 logger.warning("camera '%s': could not set option '%s'=%g: %s", spec.key, name, value, e)
 
+    def stamps(self) -> Dict[str, float]:
+        """When each camera's cached frame arrived, monotonic. Empty in mock mode.
+
+        The record loop paces itself at cfg.fps while the cameras run at their own rate, so a tick
+        can read a frame it has already read -- "images repeat if the camera is slower", as _loop
+        says. Comparing these tells a genuinely new frame from the same one seen again, which is
+        what the repeated frames at the start of a rollout were.
+        """
+        if self.cfg.mock:
+            return {}
+        with self._cap_lock:
+            return dict(self._stamp)
+
     def age_s(self) -> Dict[str, float]:
         """Seconds since each camera's cached frame arrived. Empty in mock mode.
 

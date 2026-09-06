@@ -119,7 +119,9 @@ class Recorder:
         self._pending_sends = 0
         self._action_seq = 0
         self._worst_image_age = 0.0  # see _note_image_age
-        self._skipped = {"camera": 0, "state": 0, "action": 0}  # see _log_skipped_after_episode
+        self._skipped = {"camera": 0, "state": 0, "action": 0, "repeat": 0, "hold": 0}
+        self._last_recorded_seq = 0
+        self._last_recorded_stamps: dict = {}
         self._preview: List[np.ndarray] = []  # downsampled review frames
         self._btn_prev: Dict[str, list] = {}
         self._btn_outcome: Optional[str] = None  # outcome chosen via a leader button this episode
@@ -382,6 +384,23 @@ class Recorder:
         if ages:
             self._worst_image_age = max(self._worst_image_age, max(ages.values()))
 
+    def _camera_stamps(self) -> dict:
+        try:
+            return self.cameras.stamps()
+        except Exception:
+            return {}
+
+    def _images_are_new(self) -> bool:
+        """Has any camera delivered a frame since the last one this episode recorded?
+
+        True in mock (no stamps) and true for the first frame of an episode, so the guard only ever
+        removes a genuine repeat.
+        """
+        now = self._camera_stamps()
+        if not now or not self._last_recorded_stamps:
+            return True
+        return any(t > self._last_recorded_stamps.get(k, -1.0) for k, t in now.items())
+
     def _drain_sent_marks(self) -> None:
         """Fold the sends that happened since the last tick into `action_seq`.
 
@@ -474,7 +493,9 @@ class Recorder:
         self._action_seq = 0
         #: Worst image staleness seen while recording this episode, reported when it ends.
         self._worst_image_age = 0.0
-        self._skipped = {"camera": 0, "state": 0, "action": 0}
+        self._skipped = {"camera": 0, "state": 0, "action": 0, "repeat": 0, "hold": 0}
+        self._last_recorded_seq = 0
+        self._last_recorded_stamps = {}
 
     def shutdown(self) -> None:
         self._stop.set()
@@ -699,9 +720,10 @@ class Recorder:
         total = sum(self._skipped.values())
         if not total:
             return
-        logger.warning(
-            "%d tick(s) inside this rollout recorded no frame (%s) -- the recording is that many "
-            "frames short of the time it covers",
+        logger.info(
+            "%d tick(s) inside this rollout recorded no frame (%s). repeat = the camera had not "
+            "produced a new image; hold = the policy was inferring and nothing was sent. Both are "
+            "dropped on purpose (record_holds=False); the others are sensor gaps.",
             total,
             ", ".join(f"{k}: {v}" for k, v in self._skipped.items() if v),
         )
@@ -845,6 +867,8 @@ class Recorder:
                 with self._lock:
                     self._pending_sends = 0
                 self._action_seq = 0
+                self._last_recorded_seq = 0
+                self._last_recorded_stamps = {}
 
             # ONE FRAME PER TICK, exactly like teleop -- not one per action the runner sent.
             #
@@ -878,7 +902,26 @@ class Recorder:
                 # already guards against for DAgger. What changed is only what happens AFTER the
                 # first send: the holds between chunks are now recorded instead of vanishing.
                 started = self._action_seq > 0
-                if started:
+                # Two ways a tick carries nothing new, both of which the recording should skip
+                # unless record_holds says otherwise.
+                #
+                # STALE IMAGE. The loop paces itself at cfg.fps while the cameras run at their own
+                # rate, so a tick can read a frame it already read -- _loop says so in as many
+                # words. Those frames are literally the previous picture with a later index, which
+                # is the "first few chunks are a repeated first frame" report; they cluster at the
+                # start of the first rollout because that is when the sensors are slowest to settle.
+                #
+                # NO NEW ACTION. Nothing is sent while the policy is inferring, so the arm is
+                # holding the last command. Keeping those frames makes elapsed time real in the
+                # video; dropping them keeps the recording to the part of the rollout that moved.
+                fresh_image = self._images_are_new()
+                fresh_action = self._action_seq > self._last_recorded_seq
+                hold = not (fresh_action or self.cfg.record_holds)
+                if started and not fresh_image:
+                    self._skipped["repeat"] += 1
+                elif started and hold:
+                    self._skipped["hold"] += 1
+                elif started:
                     # A dropped tick is a HOLE in a fixed-rate recording: the frames either side of
                     # it are further apart in reality than timestamp = index/fps says, which is the
                     # same lie this change exists to remove. cameras.healthy is all-or-nothing
@@ -894,6 +937,8 @@ class Recorder:
                         self._skipped["action"] += 1
                     else:
                         self._note_image_age()
+                        self._last_recorded_seq = self._action_seq
+                        self._last_recorded_stamps = self._camera_stamps()
                         frame = self._frame(images, snap)
                         self._ep_add(frame)
                         self._buffer_preview(frame["images"])

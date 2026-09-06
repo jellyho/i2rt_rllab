@@ -99,9 +99,9 @@ class RecorderConfig:
     abcdl_size: int = 224  # square px the cameras are resized to for the abcdl format
     # Per-frame RL signals computed from the episode outcome and stored as dataset
     # features (success / reward / mc_return) — for value/RL learners.
-    rl_features: bool = False        # enable per-frame success/reward/mc_return
-    reward_mode: str = "sparse"      # "sparse" (0/+1 at success) | "step" (-1/step, 0 at success)
-    discount_factor: float = 0.99    # γ for the Monte-Carlo return-to-go
+    rl_features: bool = False  # enable per-frame success/reward/mc_return
+    reward_mode: str = "sparse"  # "sparse" (0/+1 at success) | "step" (-1/step, 0 at success)
+    discount_factor: float = 0.99  # γ for the Monte-Carlo return-to-go
     # Video encoding speed (LeRobot). The default 'libsvtav1' (AV1) is SLOW to encode;
     # 'h264' is much faster, 'auto' picks a hardware encoder (e.g. nvenc) if available.
     vcodec: str = "libsvtav1"
@@ -156,6 +156,11 @@ class RecorderConfig:
     # because the alternative is the OOM killer taking the process mid-write and leaving
     # a dataset that will not open. 0 disables the check.
     min_free_ram_gb: float = 3.0
+    # Eval only. False (the default) records a frame only where the rollout actually advanced:
+    # a tick contributes nothing while the policy is inferring (no new action) or while the camera
+    # has not produced a new image (the loop can outrun it). True keeps those, which makes the
+    # video's elapsed time real at the cost of frames that repeat the previous one.
+    record_holds: bool = False
     mock: bool = False  # synthetic cameras + teleop stream (no hardware / robot)
     # None -> the writer follows ``mock``. False with ``mock=True`` records the synthetic stream
     # into a real LeRobot dataset (a dry run of the writer with no hardware; what the tests use).
@@ -199,9 +204,7 @@ def apply_recorder_section(cfg: RecorderConfig, rec_section) -> RecorderConfig:
     # video-encoding knobs (saving speed)
     cfg.vcodec = str(g("vcodec", cfg.vcodec))
     cfg.encoding_backend = str(g("encoding_backend", cfg.encoding_backend))
-    cfg.torchcodec_max_used_vram_gb = float(
-        g("torchcodec_max_used_vram_gb", cfg.torchcodec_max_used_vram_gb)
-    )
+    cfg.torchcodec_max_used_vram_gb = float(g("torchcodec_max_used_vram_gb", cfg.torchcodec_max_used_vram_gb))
     cfg.gop = max(1, int(g("gop", cfg.gop)))
     cfg.encoder_threads = int(g("encoder_threads", cfg.encoder_threads))
     cfg.batch_encoding_size = int(g("batch_encoding_size", cfg.batch_encoding_size))
