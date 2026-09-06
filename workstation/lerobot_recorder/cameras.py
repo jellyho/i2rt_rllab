@@ -299,6 +299,9 @@ class CameraManager:
         with self._cap_lock:
             for spec in self.specs:
                 img = self._last.get(spec.key)
+                # A camera that has never delivered gets black, for the GUI's benefit. It must
+                # not reach a dataset: `healthy` is False until every camera has delivered at
+                # least once, and the recorder records nothing while it is False.
                 out[spec.key] = img.copy() if img is not None else np.zeros((spec.height, spec.width, 3), np.uint8)
         return out
 
@@ -322,8 +325,24 @@ class CameraManager:
 
     @property
     def healthy(self) -> bool:
-        """True iff every camera delivered a frame on the latest read (always True in mock)."""
-        return all(self._healthy.values()) if self._healthy else True
+        """True iff every camera has delivered at least one frame AND is currently delivering.
+
+        The "at least one" half is the part that was missing, and it is the whole of the
+        start-of-episode problem. `_healthy` is EMPTY until the capture thread's first pass, and
+        this used to return True for an empty dict -- so before any camera had produced anything,
+        the recorder believed the sensors were fine, `read()` handed it the zeros it fabricates for
+        a camera with no frame yet, and those went into the episode. Once one real frame arrives it
+        is then copied to every tick until the next one, which is the "first few chunks are a
+        repeated first frame, especially the very first rollout" report. Nothing further along can
+        tell a fabricated frame from a real one; only here is the difference still visible.
+        """
+        if self.cfg.mock:
+            return True
+        if not self._pipelines:  # not started
+            return False
+        with self._cap_lock:
+            delivered = set(self._last)
+        return all(spec.key in delivered for spec in self.specs) and all(self._healthy.values())
 
     def stop(self) -> None:
         self._cap_stop.set()

@@ -394,9 +394,31 @@ def test_finish_clears_policy_action_and_latched_rollout_request():
     assert bridge._policy_action_req is None
 
 
+class _HealthyCameras:
+    """Stand-in for a CameraManager that has delivered.
+
+    `cameras.healthy` is False until every camera has produced at least one frame -- a real
+    camera has not, before its pipeline starts, and a test that never starts one would otherwise
+    record nothing. These tests are about the DAgger gate, not about sensor health, so they say
+    the sensors are up and mean it.
+    """
+
+    healthy = True
+    image_keys = ("agentview",)
+
+    @staticmethod
+    def stamps():
+        return {}
+
+    @staticmethod
+    def age_s():
+        return {}
+
+
 def test_dagger_records_one_rollout_across_interventions():
     cfg = RecorderConfig(record_source="dagger", mock=False)
     rec = Recorder(cfg)
+    rec.cameras = _HealthyCameras()
     rec.writer = _FakeWriter()
     submitted = rec.writer.saved
     rec.gate.arm()
@@ -439,6 +461,7 @@ def test_dagger_records_one_rollout_across_interventions():
 def test_dagger_discard_drops_the_complete_rollout():
     cfg = RecorderConfig(record_source="dagger", mock=False, review_before_save=False)
     rec = Recorder(cfg)
+    rec.cameras = _HealthyCameras()
     rec.writer = _FakeWriter()
     rec.gate.arm()
     images = {"agentview": np.zeros((4, 4, 3), np.uint8)}
@@ -959,37 +982,14 @@ def test_nothing_is_recorded_before_the_first_action_of_a_rollout(tmp_path):
         rec.shutdown()
 
 
-def test_action_seq_restarts_each_rollout(tmp_path):
-    """Chunk numbering is per episode; rollout two must not continue rollout one's count."""
-    cfg = RecorderConfig(
-        repo_id="test/seq2", root=str(tmp_path), fps=30, mock=True, record_source="eval", review_before_save=False
-    )
-    rec = Recorder(cfg)
-    rec.cameras.start()
-    rec.robot.start()
-    rec._last_images = rec.cameras.read()
-    rec.writer = rec._open_writer()
-    rec.gate.arm()
-    try:
-        for _ in range(2):
-            rec.note_action_sent(np.zeros(ACTION_DIM, dtype=np.float32))
-            rec._step(rec.get_last_images(), rec.robot.get_snapshot())
-        rec.end_rollout()
-        rec._step(rec.get_last_images(), rec.robot.get_snapshot())
-        rec.note_action_sent(np.zeros(ACTION_DIM, dtype=np.float32))
-        rec._step(rec.get_last_images(), rec.robot.get_snapshot())
-        assert [int(f["action_seq"][0]) for f in _in_flight(rec)] == [1]
-    finally:
-        rec.shutdown()
-
-
 def test_the_sample_frame_declares_every_key_a_real_frame_carries(tmp_path):
     """The sample frame IS the declared schema, so it has to match what _frame() emits.
 
     LeRobot rejects an add_frame whose keys differ from the schema in EITHER direction, and it
     rejects it per frame -- so a key added to _frame() and not to _sample_frame() does not fail at
-    open, it fails on every save and stops the writer. That is exactly what `action_seq` did on a
-    brand-new dataset. This compares the two directly so the next added column cannot repeat it.
+    open, it fails on every save and stops the writer. That is exactly what a briefly-added
+    `action_seq` column did on a brand-new dataset. This compares the two directly, so the next
+    column added to one and not the other cannot repeat it.
     """
     cfg = RecorderConfig(repo_id="test/schema", root=str(tmp_path), fps=30, mock=True, record_source="eval")
     rec = Recorder(cfg)
@@ -1085,19 +1085,6 @@ def test_record_holds_keeps_the_inference_gap(tmp_path):
         rec.shutdown()
 
 
-def test_action_seq_marks_the_chunk_boundary(tmp_path):
-    """Each recorded frame says which chunk it belongs to, so the send stream stays recoverable."""
-    rec = _eval_rec(tmp_path, "seq")
-    try:
-        for tick in range(6):
-            if tick in (0, 2, 5):
-                rec.note_action_sent(np.zeros(ACTION_DIM, dtype=np.float32))
-            rec._step(rec.get_last_images(), rec.robot.get_snapshot())
-        assert [int(f["action_seq"][0]) for f in _in_flight(rec)] == [1, 2, 3]
-    finally:
-        rec.shutdown()
-
-
 def test_a_sensor_gap_is_counted_separately_from_a_hold(tmp_path):
     """A missing sensor is not the same event as the policy thinking, and the log says which."""
     rec = _eval_rec(tmp_path, "gap")
@@ -1112,5 +1099,27 @@ def test_a_sensor_gap_is_counted_separately_from_a_hold(tmp_path):
         assert rec.get_status()["frames"] == 1, "the blind tick must not become a frame"
         assert rec._skipped["state"] == 1, rec._skipped
         assert rec._skipped["hold"] == 0, rec._skipped
+    finally:
+        rec.shutdown()
+
+
+def test_the_send_counter_restarts_each_rollout(tmp_path):
+    """The counter gates recording, so it has to restart with the rollout.
+
+    It is not a column -- the runner infers on every control tick, so it counts sends rather than
+    chunks, and with holds dropped it would only restate the frame index. What it decides is
+    whether a tick has anything new, and a value carried over from the previous rollout makes the
+    next one look already started through the whole wait for its first inference.
+    """
+    rec = _eval_rec(tmp_path, "seqreset")
+    try:
+        rec.note_action_sent(np.zeros(ACTION_DIM, dtype=np.float32))
+        rec._step(rec.get_last_images(), rec.robot.get_snapshot())
+        assert rec.get_status()["frames"] == 1
+        rec.end_rollout()
+        rec._step(rec.get_last_images(), rec.robot.get_snapshot())
+        assert rec._action_seq == 0
+        rec._step(rec.get_last_images(), rec.robot.get_snapshot())
+        assert rec.get_status()["frames"] == 0, "the wait before the first action is not the rollout"
     finally:
         rec.shutdown()

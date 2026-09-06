@@ -114,8 +114,12 @@ class Recorder:
         # images/state/extras and made the first chunk render as a frozen fan). deque.append/popleft
         # are individually atomic in CPython, so no lock is needed across the two threads.
         self._sent_frames: "collections.deque[dict]" = collections.deque()
-        #: Sends the runner has reported since the last record tick, and the running chunk index
-        #: the next frame will carry. Written on the runner's thread, read on the record loop.
+        #: Sends the runner has reported since the last record tick, and the running count of them
+        #: this rollout. Written on the runner's thread, read on the record loop. NOT a column: the
+        #: runner calls on_action_sent once per CONTROL TICK (deploy_runner._loop infers every
+        #: iteration), not once per chunk, and with holds dropped every recorded frame has a fresh
+        #: send -- so the value would just be the frame index again. It exists to answer "did
+        #: anything new arrive since the last frame", which is the whole record gate.
         self._pending_sends = 0
         self._action_seq = 0
         self._worst_image_age = 0.0  # see _note_image_age
@@ -264,11 +268,6 @@ class Recorder:
             "observation.eef": np.zeros(EEF_DIM, np.float32),
             "observation.control_mode": np.zeros(1, np.float32),
             "action": np.zeros(ACTION_DIM, np.float32),
-            # Every key _frame() emits has to be here: this dict IS the declared schema, and
-            # LeRobot rejects an add_frame whose keys differ from it in either direction, on
-            # every frame. Adding action_seq to _frame() without adding it here made a brand-new
-            # dataset fail on its first save.
-            "action_seq": np.zeros(1, np.float32),
             **{name: np.zeros(int(np.prod(shape)), np.float32) for name, shape in self._extra_features.items()},
         }
 
@@ -598,11 +597,12 @@ class Recorder:
         rate exactly as teleop does (see _step), which is also the convention every training episode
         was recorded under.
 
-        What is still worth knowing from the send stream is WHEN a new chunk started, so this bumps
-        a counter the next recorded frame carries as `action_seq`. Frames within one chunk share a
-        value; a boundary is where it increments; a stretch where it does not increment is the
-        policy thinking. Nothing is dropped, so the analysis can reconstruct the send stream while
-        the video keeps real time.
+        The counter it bumps is the record gate: a tick with no new send is the policy inferring,
+        and with cfg.record_holds off that tick contributes no frame. It is deliberately NOT a
+        dataset column. The runner infers on every control tick, so this counts sends and not
+        chunks, and once holds are dropped every recorded frame has its own send -- the column
+        would have restated the frame index. The real chunk boundary lives in the runner
+        (_note_chunk / _last_chunk_index) and belongs there.
 
         A no-op unless armed in eval mode, for the same reason as before: a mark outside a rollout
         belongs to nothing."""
@@ -815,10 +815,6 @@ class Recorder:
             "observation.eef": self._fit(snap.get("eef"), EEF_DIM),
             "observation.control_mode": np.array([control_mode], dtype=np.float32),
             "action": self._fit(snap.get("action") if action is None else action, ACTION_DIM),
-            # Which chunk this frame belongs to. Constant across a chunk, +1 at a replan, flat
-            # while the policy is inferring -- so "the arm held here because it was thinking" is
-            # recoverable from the dataset instead of being inferred from missing frames.
-            "action_seq": np.array([self._action_seq], dtype=np.float32),
             **self._extra_values(),
         }
 
