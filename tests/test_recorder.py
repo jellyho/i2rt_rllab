@@ -1094,3 +1094,24 @@ def test_a_tick_that_records_nothing_is_counted_not_swallowed(tmp_path):
         assert rec._skipped["state"] == 1, rec._skipped
     finally:
         rec.shutdown()
+
+
+def test_the_sample_frame_declares_every_key_a_real_frame_carries(tmp_path):
+    """The sample frame IS the declared schema, so it has to match what _frame() emits.
+
+    LeRobot rejects an add_frame whose keys differ from the schema in EITHER direction, and it
+    rejects it per frame -- so a key added to _frame() and not to _sample_frame() does not fail at
+    open, it fails on every save and stops the writer. That is exactly what `action_seq` did on a
+    brand-new dataset. This compares the two directly so the next added column cannot repeat it.
+    """
+    cfg = RecorderConfig(repo_id="test/schema", root=str(tmp_path), fps=30, mock=True, record_source="eval")
+    rec = Recorder(cfg)
+    rec.cameras.start()
+    rec.robot.start()
+    try:
+        sample = set(rec._sample_frame())
+        real = set(rec._frame(rec.cameras.read(), rec.robot.get_snapshot()))
+        assert real - sample == set(), f"_frame emits keys the schema does not declare: {real - sample}"
+        assert sample - real == set(), f"the schema declares keys no frame carries: {sample - real}"
+    finally:
+        rec.shutdown()

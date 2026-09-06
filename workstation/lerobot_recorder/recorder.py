@@ -262,6 +262,11 @@ class Recorder:
             "observation.eef": np.zeros(EEF_DIM, np.float32),
             "observation.control_mode": np.zeros(1, np.float32),
             "action": np.zeros(ACTION_DIM, np.float32),
+            # Every key _frame() emits has to be here: this dict IS the declared schema, and
+            # LeRobot rejects an add_frame whose keys differ from it in either direction, on
+            # every frame. Adding action_seq to _frame() without adding it here made a brand-new
+            # dataset fail on its first save.
+            "action_seq": np.zeros(1, np.float32),
             **{name: np.zeros(int(np.prod(shape)), np.float32) for name, shape in self._extra_features.items()},
         }
 
